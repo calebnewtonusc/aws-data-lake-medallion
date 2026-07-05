@@ -1,0 +1,5 @@
+pyspark==3.5.4
+boto3
+moto
+pyarrow
+pytest
