@@ -2,8 +2,21 @@
 
 The local run uses moto to mock S3 so the pipeline is fully offline. The same
 code targets a real AWS account by changing configuration only, never logic.
-This mirrors the ZTM Data Engineering course, which runs the Spark job on EMR
-Serverless against S3 and queries the result with Athena.
+This mirrors the ZTM Data Engineering course, which combines three AWS
+services: S3 for storage, EMR for Spark compute, and Athena for querying.
+
+## Local stand-ins mapped to AWS
+
+| Concern                | AWS service                                           | Local stand-in                    |
+| ---------------------- | ----------------------------------------------------- | --------------------------------- |
+| Storage                | S3, one bucket with bronze, silver, and gold prefixes | moto in-process mock S3           |
+| Compute and processing | EMR running the PySpark bronze, silver, and gold jobs | local Spark (`local[*]`)          |
+| Query and analytics    | Athena over the gold parquet                          | the same DDL, run against real S3 |
+
+The medallion PySpark code does not change between the two. Locally it runs on
+a local Spark session that stands in for EMR; on AWS the identical jobs are
+submitted to an EMR cluster. Only the configured paths differ: `data/lake` on
+disk locally, `s3://<bucket>/...` on AWS.
 
 ## 1. Configure credentials
 

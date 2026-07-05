@@ -1,30 +1,56 @@
 # Airbnb Medallion Data Lake on AWS S3
 
 A production-shaped medallion architecture data lake for Airbnb listings and
-reviews, built with PySpark and boto3. It lands raw data in S3, refines it
-through bronze, silver, and gold layers, and exposes the gold layer to Athena.
-The entire pipeline runs offline on a laptop using the moto library to mock S3,
-and the path to a real AWS deployment on EMR Serverless plus Athena is
+reviews that combines three AWS services: S3 for storage, EMR (Spark on EMR)
+as the processing and compute layer that runs the bronze, silver, and gold
+jobs, and Athena for querying the gold layer. It is built with PySpark and
+boto3. The entire pipeline runs offline on a laptop, where moto stands in for
+S3 and local Spark stands in for EMR, and the path to a real AWS deployment is
 documented. This is the data lake project from the ZTM Data Engineering course,
 rebuilt end to end around its Airbnb dataset.
 
+## The AWS trio: S3, EMR, and Athena
+
+| Concern                | AWS service                                           | Local stand-in                                   |
+| ---------------------- | ----------------------------------------------------- | ------------------------------------------------ |
+| Storage                | S3, one bucket with bronze, silver, and gold prefixes | moto in-process mock S3                          |
+| Compute and processing | EMR running the PySpark bronze, silver, and gold jobs | local Spark (`local[*]`)                         |
+| Query and analytics    | Athena over the gold parquet, schema-on-read          | the same Athena DDL, run once data is in real S3 |
+
+The PySpark code that performs the medallion transformations is identical in
+both environments. Locally it executes on a local Spark session standing in for
+EMR; on AWS the same jobs are submitted to an EMR cluster. Only the configured
+paths change: `data/lake` on disk locally, `s3://<bucket>/...` on AWS.
+
 ## Architecture
 
+The compute that moves data between layers runs on EMR (local Spark stands in
+for EMR when running offline). The layers themselves live in S3, and Athena
+queries the gold layer in place.
+
 ```mermaid
-flowchart LR
+flowchart TB
     GEN[Synthetic generator<br/>listings and reviews JSON] --> BRONZE
 
-    subgraph S3[AWS S3 data lake]
+    subgraph S3[AWS S3: storage]
         BRONZE[Bronze<br/>raw JSON<br/>bronze/dataset/ingest_date=]
         SILVER[Silver<br/>cleaned typed parquet<br/>silver/reviews partitioned by month]
         GOLD[Gold<br/>business aggregates parquet<br/>gold/reviews_per_listing]
     end
 
-    BRONZE -->|PySpark clean, cast, dedupe| SILVER
-    SILVER -->|data-quality gate| QC{Checks pass?}
-    QC -->|no| FAIL[Fail loudly]
-    QC -->|yes| GOLD
-    GOLD --> ATHENA[Athena / Glue<br/>external tables<br/>schema-on-read]
+    subgraph EMR[EMR: Spark compute, local Spark locally]
+        SILVERJOB[Silver job<br/>clean, cast, dedupe]
+        QC{Data-quality<br/>gate}
+        GOLDJOB[Gold job<br/>join and aggregate]
+    end
+
+    BRONZE --> SILVERJOB
+    SILVERJOB --> SILVER
+    SILVER --> QC
+    QC -->|fail| FAIL[Halt the run]
+    QC -->|pass| GOLDJOB
+    GOLDJOB --> GOLD
+    GOLD --> ATHENA[Athena: query<br/>external tables, schema-on-read]
     ATHENA --> BI[Analyst queries and BI]
 ```
 
@@ -51,11 +77,14 @@ the run rather than letting bad data reach the business tables.
 
 ## Tech stack
 
-- PySpark 3.5.4 for the silver and gold transformations
+- Amazon S3 for lake storage, with bronze, silver, and gold prefixes
+- Amazon EMR as the Spark compute layer that runs the bronze, silver, and gold
+  jobs; locally this is a local Spark session standing in for EMR
+- PySpark 3.5.4 for the bronze, silver, and gold transformations
 - boto3 for the S3 bronze landing zone
 - moto for an in-process mock S3, so the pipeline runs with no AWS account
 - pyarrow for parquet
-- Athena and AWS Glue for schema-on-read querying of the gold layer
+- Amazon Athena and AWS Glue for schema-on-read querying of the gold layer
 - pytest for the test suite
 
 ## Design notes
