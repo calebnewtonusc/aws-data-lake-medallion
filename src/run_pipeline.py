@@ -19,7 +19,7 @@ from . import bronze, config, gold, quality, storage
 from .spark_session import build_spark
 
 sys.path.insert(0, "scripts")
-from generate_events import generate  # noqa: E402
+from generate_events import generate_all  # noqa: E402
 
 
 def _print_header(title: str) -> None:
@@ -43,21 +43,31 @@ def run(num_listings: int, ingest_date: str, seed: int) -> dict[str, object]:
     _print_header("Bronze: landing raw Airbnb data in mock S3")
     client = storage.s3_client()
     storage.ensure_bucket(client)
-    listings, reviews = generate(
+    datasets = generate_all(
         num_listings=num_listings,
         reviews_per_listing=6,
+        bookings_per_listing=4,
         dirty_ratio=0.08,
         duplicate_ratio=0.05,
         seed=seed,
     )
+    listings, reviews = datasets["listings"], datasets["reviews"]
+    bookings, transactions = datasets["bookings"], datasets["transactions"]
     listings_landed = bronze.land_dataset(client, config.LISTINGS_DATASET, listings, ingest_date=ingest_date)
     reviews_landed = bronze.land_dataset(client, config.REVIEWS_DATASET, reviews, ingest_date=ingest_date)
-    listings_verified = bronze.count_landed(client, config.LISTINGS_DATASET, ingest_date=ingest_date)
-    reviews_verified = bronze.count_landed(client, config.REVIEWS_DATASET, ingest_date=ingest_date)
+    bookings_landed = bronze.land_dataset(client, config.BOOKINGS_DATASET, bookings, ingest_date=ingest_date)
+    txns_landed = bronze.land_dataset(client, config.TRANSACTIONS_DATASET, transactions, ingest_date=ingest_date)
     results["bronze_listings"] = listings_landed
     results["bronze_reviews"] = reviews_landed
-    print(f"Landed {listings_landed} listings and {reviews_landed} reviews to {config.BRONZE.s3_uri()}")
-    print(f"Verified {listings_verified} listings and {reviews_verified} reviews readable back through the S3 API")
+    results["bronze_bookings"] = bookings_landed
+    results["bronze_transactions"] = txns_landed
+    print(f"Landed {listings_landed} listings, {reviews_landed} reviews, {bookings_landed} bookings, "
+          f"and {txns_landed} transactions to {config.BRONZE.s3_uri()}")
+    verified = sum(
+        bronze.count_landed(client, ds, ingest_date=ingest_date)
+        for ds in (config.LISTINGS_DATASET, config.REVIEWS_DATASET, config.BOOKINGS_DATASET, config.TRANSACTIONS_DATASET)
+    )
+    print(f"Verified {verified} total records readable back through the S3 API")
 
     spark = build_spark()
     spark.sparkContext.setLogLevel("ERROR")
@@ -67,7 +77,10 @@ def run(num_listings: int, ingest_date: str, seed: int) -> dict[str, object]:
         _print_header("Silver: cleaning, validating, deduplicating")
         silver_counts = silver_job.run(spark)
         results["silver_counts"] = silver_counts
-        print(f"Wrote {silver_counts['listings']} clean listings and {silver_counts['reviews']} clean reviews to silver")
+        print(
+            f"Wrote {silver_counts['listings']} listings, {silver_counts['reviews']} reviews, "
+            f"{silver_counts.get('bookings', 0)} bookings, {silver_counts.get('transactions', 0)} transactions to silver"
+        )
 
         _print_header("Data quality: gating the silver reviews table")
         silver_reviews = gold.read_silver_reviews(spark)
@@ -88,19 +101,33 @@ def run(num_listings: int, ingest_date: str, seed: int) -> dict[str, object]:
         _print_header("Sample gold output: reviews per listing (top 10)")
         gold.reviews_per_listing(silver_listings, silver_reviews).show(10, truncate=False)
 
-        _print_header("Sample gold output: average rating per listing (top 10)")
-        gold.avg_rating_per_listing(silver_listings, silver_reviews).show(10, truncate=False)
-
         _print_header("Sample gold output: reviews per neighbourhood")
         gold.reviews_per_neighbourhood(silver_listings, silver_reviews).show(20, truncate=False)
+
+        silver_bookings = gold.read_silver_bookings(spark)
+        _print_header("Sample gold output: revenue by listing and month (top 10)")
+        gold.revenue_by_listing_month(silver_listings, silver_bookings).show(10, truncate=False)
+
+        _print_header("Sample gold output: booking conversion (top 10)")
+        gold.booking_conversion(silver_listings, silver_bookings).show(10, truncate=False)
+
+        silver_transactions = gold.read_silver_transactions(spark)
+        _print_header("Sample gold output: transaction success rates by payment method")
+        gold.transaction_success_rates(silver_transactions).show(20, truncate=False)
     finally:
         spark.stop()
 
     _print_header("Pipeline summary")
-    print(f"bronze: {results['bronze_listings']} listings + {results['bronze_reviews']} reviews landed")
+    print(
+        f"bronze: {results['bronze_listings']} listings + {results['bronze_reviews']} reviews + "
+        f"{results['bronze_bookings']} bookings + {results['bronze_transactions']} transactions landed"
+    )
     silver_counts = results["silver_counts"]
     assert isinstance(silver_counts, dict)
-    print(f"silver: {silver_counts['listings']} listings + {silver_counts['reviews']} reviews")
+    print(
+        f"silver: {silver_counts['listings']} listings + {silver_counts['reviews']} reviews + "
+        f"{silver_counts.get('bookings', 0)} bookings + {silver_counts.get('transactions', 0)} transactions"
+    )
     gold_counts = results["gold_counts"]
     assert isinstance(gold_counts, dict)
     for name, rows in gold_counts.items():

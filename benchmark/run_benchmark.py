@@ -1,0 +1,423 @@
+"""Query-optimization benchmark: unoptimized lake vs optimized lake.
+
+This is the centerpiece of the project. It builds two physically different
+copies of the same synthetic transaction data and times a fixed set of
+analytical queries against each, so the runtime reduction reported on the
+resume is a real measured number rather than an assumption.
+
+Baseline layout (everything a slow lake gets wrong):
+  - a single large CSV, no columnar format, no column statistics
+  - unpartitioned, so every query scans the whole dataset
+  - unsorted, so predicate pushdown and min/max skipping cannot help
+  - all columns present, forcing full-width reads
+
+Optimized layout (the techniques the resume bullet claims):
+  - Parquet with per-file column statistics (min/max, null counts)
+  - partitioned by transaction month, so date filters prune whole directories
+    without over-partitioning to thousands of tiny daily directories
+  - compacted into right-sized files (one file per partition) to kill the
+    small-file tax
+  - pruned to only the columns the queries need
+  - sorted within each partition on transaction date and the common filter
+    columns so Parquet row group min/max stats enable predicate pushdown and
+    page skipping even for day-level and status filters
+
+The queries deliberately exercise each technique:
+  q1 date-range aggregation      -> partition pruning + stats skipping
+  q2 status filter + group by     -> column pruning + predicate pushdown
+  q3 single-day point lookup      -> partition pruning to one directory
+  q4 join bookings to txns (rewrite: filter-before-join, no SELECT *)
+  q5 wide full-scan aggregation   -> column pruning benefit on a heavy scan
+
+Each query runs on both datasets: one warm-up run (discarded) then several
+timed runs, and the median wall-clock is taken to damp out JVM and OS noise.
+Spark is configured identically for both sides so the comparison is fair; the
+only difference is the physical layout of the data.
+
+Run it:
+
+    export JAVA_HOME=$(/usr/libexec/java_home)
+    python -m benchmark.run_benchmark --rows 30000000 --runs 5
+
+Datasets are written under benchmark/_data (gitignored) and reused across
+runs unless --rebuild is passed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import statistics
+import sys
+import time
+from datetime import date, timedelta
+from pathlib import Path
+
+# Pin driver and worker Python to this interpreter before Spark starts so the
+# workers never resolve a different Python from PATH.
+os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+
+from pyspark.sql import DataFrame, SparkSession  # noqa: E402
+from pyspark.sql import functions as F  # noqa: E402
+
+BENCH_ROOT = Path(__file__).resolve().parent
+DATA_ROOT = BENCH_ROOT / "_data"
+BASELINE_CSV = DATA_ROOT / "baseline_csv"
+OPTIMIZED_TXNS = DATA_ROOT / "optimized_transactions"
+OPTIMIZED_BOOKINGS = DATA_ROOT / "optimized_bookings"
+
+# Fixed reference window the synthetic data spans. Queries filter inside it.
+START_DATE = date(2023, 1, 1)
+NUM_DAYS = 365 * 2  # two years of daily partitions
+STATUSES = ["succeeded", "failed", "refunded"]
+CURRENCIES = ["USD", "EUR", "GBP", "AUD"]
+METHODS = ["card", "paypal", "apple_pay", "google_pay", "bank_transfer"]
+
+
+def build_spark(app_name: str = "query-optimization-benchmark") -> SparkSession:
+    """Create a local SparkSession used identically for both benchmark sides.
+
+    The config is intentionally fixed and applied once so that the only
+    variable between the baseline and optimized runs is the data layout. AQE
+    is left on because it is on by default in any modern deployment; leaving it
+    on for both sides keeps the comparison representative and fair.
+    """
+    warehouse = (BENCH_ROOT / "_spark_warehouse").resolve()
+    return (
+        SparkSession.builder.appName(app_name)
+        .master("local[*]")
+        .config("spark.sql.warehouse.dir", str(warehouse))
+        .config("spark.sql.shuffle.partitions", "16")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.parquet.filterPushdown", "true")
+        .config("spark.sql.parquet.aggregatePushdown", "true")
+        .config("spark.driver.memory", "4g")
+        .getOrCreate()
+    )
+
+
+def _synthesize(spark: SparkSession, rows: int) -> DataFrame:
+    """Build a synthetic transactions DataFrame of the requested row count.
+
+    Uses spark.range plus deterministic hashing so the same row count always
+    yields the same data, and so generation scales to tens of millions of rows
+    without collecting to the driver. Columns mirror the transactions dataset
+    plus a few wide filler columns so column pruning has something to prune.
+    """
+    base = spark.range(0, rows).withColumnRenamed("id", "txn_id")
+    # Spread rows deterministically across the daily partition window.
+    day_offset = ((F.col("txn_id") * F.lit(2654435761)) % F.lit(NUM_DAYS)).cast("int")
+    df = (
+        base.withColumn("booking_id", (F.col("txn_id") % F.lit(rows // 3 + 1)))
+        .withColumn("day_offset", day_offset)
+        .withColumn("txn_date", F.date_add(F.lit(START_DATE.isoformat()).cast("date"), F.col("day_offset")))
+        .drop("day_offset")
+        .withColumn("ts", F.col("txn_date").cast("timestamp"))
+        .withColumn("txn_month", F.date_format(F.col("txn_date"), "yyyy-MM"))
+        .withColumn("amount", F.round((F.rand(seed=13) * F.lit(950.0)) + F.lit(50.0), 2))
+        .withColumn("status", F.element_at(F.array(*[F.lit(s) for s in STATUSES]), (F.col("txn_id") % F.lit(len(STATUSES)) + 1).cast("int")))
+        .withColumn("currency", F.element_at(F.array(*[F.lit(c) for c in CURRENCIES]), (F.col("txn_id") % F.lit(len(CURRENCIES)) + 1).cast("int")))
+        .withColumn("payment_method", F.element_at(F.array(*[F.lit(m) for m in METHODS]), (F.col("txn_id") % F.lit(len(METHODS)) + 1).cast("int")))
+        # Wide filler columns: realistic dead weight a naive schema carries and
+        # the optimized layout prunes away.
+        .withColumn("device", F.concat(F.lit("device-"), (F.col("txn_id") % F.lit(5000)).cast("string")))
+        .withColumn("ip_hash", F.sha2(F.col("txn_id").cast("string"), 256))
+        .withColumn("user_agent", F.concat(F.lit("client/"), (F.col("txn_id") % F.lit(200)).cast("string"), F.lit(" (compatible; benchmark)")))
+        .withColumn("note", F.concat(F.lit("txn note padding text for row "), F.col("txn_id").cast("string")))
+    )
+    return df
+
+
+def build_datasets(spark: SparkSession, rows: int) -> None:
+    """Materialize the baseline and optimized physical layouts on disk."""
+    print(f"Synthesizing {rows:,} transaction rows ...")
+    txns = _synthesize(spark, rows)
+
+    # Baseline: one big CSV, unpartitioned, unsorted, all columns, no columnar
+    # stats. coalesce(1) forces a single large file: the classic slow lake
+    # shape a raw dump lands in before any optimization.
+    print("Writing baseline CSV (single unpartitioned file, all columns) ...")
+    if BASELINE_CSV.exists():
+        shutil.rmtree(BASELINE_CSV)
+    txns.coalesce(1).write.mode("overwrite").option("header", "true").csv(str(BASELINE_CSV))
+
+    # Optimized transactions: partitioned by month (a sensible grain, not
+    # over-partitioned to the day), one compacted file per partition, only the
+    # needed columns, sorted within partition on txn_date then the common
+    # filter columns so Parquet row-group min/max stats enable predicate
+    # pushdown and page skipping even for day-level and status filters.
+    print("Writing optimized transactions (month-partitioned, compacted, pruned, sorted) ...")
+    if OPTIMIZED_TXNS.exists():
+        shutil.rmtree(OPTIMIZED_TXNS)
+    needed = txns.select(
+        "txn_id", "booking_id", "txn_date", "txn_month", "amount", "status", "currency", "payment_method"
+    )
+    num_months = NUM_DAYS // 30 + 2
+    (
+        needed.repartition(num_months, "txn_month")  # one file per month partition -> compaction
+        .sortWithinPartitions("txn_date", "status", "amount")  # sort for min/max pushdown
+        .write.mode("overwrite")
+        .partitionBy("txn_month")
+        .parquet(str(OPTIMIZED_TXNS))
+    )
+
+    # A small bookings dimension for the join query, keyed on booking_id.
+    print("Writing optimized bookings dimension ...")
+    if OPTIMIZED_BOOKINGS.exists():
+        shutil.rmtree(OPTIMIZED_BOOKINGS)
+    num_bookings = rows // 3 + 1
+    bookings = (
+        spark.range(0, num_bookings)
+        .withColumnRenamed("id", "booking_id")
+        .withColumn("listing_id", (F.col("booking_id") % F.lit(50000)))
+        .withColumn("nights", (F.col("booking_id") % F.lit(14) + 1).cast("int"))
+        .withColumn("guest_id", (F.col("booking_id") % F.lit(900000) + 100000))
+    )
+    bookings.repartition(8).write.mode("overwrite").parquet(str(OPTIMIZED_BOOKINGS))
+    print("Datasets built.")
+
+
+# ---------------------------------------------------------------------------
+# Queries. Each returns a DataFrame; the harness triggers a full action.
+# ---------------------------------------------------------------------------
+
+
+def _target_month_bounds() -> tuple[str, str]:
+    """A representative one-month date range inside the data window."""
+    start = START_DATE + timedelta(days=400)
+    end = start + timedelta(days=30)
+    return start.isoformat(), end.isoformat()
+
+
+def q1_date_range_agg(df: DataFrame) -> DataFrame:
+    """Aggregate amount over a one-month window (partition pruning + stats)."""
+    lo, hi = _target_month_bounds()
+    return (
+        df.where((F.col("txn_date") >= F.lit(lo)) & (F.col("txn_date") < F.lit(hi)))
+        .groupBy("status")
+        .agg(F.sum("amount").alias("total"), F.count("*").alias("n"))
+    )
+
+
+def q2_status_filter_group(df: DataFrame) -> DataFrame:
+    """Filter to succeeded and group by method (column pruning + pushdown)."""
+    return (
+        df.where(F.col("status") == F.lit("succeeded"))
+        .groupBy("payment_method")
+        .agg(F.sum("amount").alias("total"), F.avg("amount").alias("avg_amt"))
+    )
+
+
+def q3_single_day_lookup(df: DataFrame) -> DataFrame:
+    """Aggregate a single day (best case for partition pruning)."""
+    day = (START_DATE + timedelta(days=500)).isoformat()
+    return df.where(F.col("txn_date") == F.lit(day)).groupBy("currency").agg(F.sum("amount").alias("total"))
+
+
+def q4_join_filter_before_join(df: DataFrame, bookings: DataFrame) -> DataFrame:
+    """Join succeeded txns in a date window to bookings.
+
+    The SQL rewrite: filter both sides down before the join and select only the
+    join keys plus needed measures, rather than joining wide tables and
+    filtering after (and never SELECT *).
+    """
+    lo, hi = _target_month_bounds()
+    txn_slim = (
+        df.where(
+            (F.col("status") == F.lit("succeeded"))
+            & (F.col("txn_date") >= F.lit(lo))
+            & (F.col("txn_date") < F.lit(hi))
+        )
+        .select("booking_id", "amount")
+    )
+    book_slim = bookings.select("booking_id", "listing_id", "nights")
+    return (
+        txn_slim.join(book_slim, on="booking_id", how="inner")
+        .groupBy("listing_id")
+        .agg(F.sum("amount").alias("revenue"), F.sum("nights").alias("nights"))
+    )
+
+
+def q5_wide_scan_agg(df: DataFrame) -> DataFrame:
+    """Global aggregation touching only two columns of a wide table.
+
+    On the baseline this must read the full-width rows; on the optimized layout
+    only two columns are read, isolating the column-pruning benefit.
+    """
+    return df.groupBy("status").agg(F.sum("amount").alias("total"), F.count("*").alias("n"))
+
+
+QUERIES = [
+    ("q1_date_range_agg", "Date-range aggregation (partition pruning + stats)"),
+    ("q2_status_filter_group", "Status filter + group by (column pruning + pushdown)"),
+    ("q3_single_day_lookup", "Single-day point lookup (partition pruning)"),
+    ("q4_join_filter_before_join", "Join with filter-before-join rewrite"),
+    ("q5_wide_scan_agg", "Wide-table scan aggregation (column pruning)"),
+]
+
+
+def _time_query(fn, runs: int) -> float:
+    """Run fn once to warm up, then time `runs` executions, return the median.
+
+    fn must build a DataFrame and trigger a full action (count) so the whole
+    query executes. Wall-clock is used because that is what a user waits on.
+    """
+    # Warm-up (discarded): pays JIT, metadata, and filesystem cache costs once.
+    fn()
+    samples: list[float] = []
+    for _ in range(runs):
+        start = time.perf_counter()
+        fn()
+        samples.append(time.perf_counter() - start)
+    return statistics.median(samples)
+
+
+def run_benchmark(spark: SparkSession, runs: int) -> dict:
+    """Time every query on the baseline and optimized layouts, return results.
+
+    The baseline is the raw unoptimized lake: a single large CSV with no
+    columnar format, no statistics, no partitioning, and every column present.
+    The optimized side is the month-partitioned, compacted, column-pruned,
+    sorted Parquet. Both are read with the same Spark session and config, so
+    the only difference is the physical data layout.
+    """
+    baseline = spark.read.option("header", "true").option("inferSchema", "true").csv(str(BASELINE_CSV))
+    optimized = spark.read.parquet(str(OPTIMIZED_TXNS))
+    bookings = spark.read.parquet(str(OPTIMIZED_BOOKINGS))
+
+    # Bind each query name to a no-arg callable that triggers a full action.
+    def action(df: DataFrame) -> int:
+        return df.count()
+
+    plans = {
+        "q1_date_range_agg": (
+            lambda: action(q1_date_range_agg(baseline)),
+            lambda: action(q1_date_range_agg(optimized)),
+        ),
+        "q2_status_filter_group": (
+            lambda: action(q2_status_filter_group(baseline)),
+            lambda: action(q2_status_filter_group(optimized)),
+        ),
+        "q3_single_day_lookup": (
+            lambda: action(q3_single_day_lookup(baseline)),
+            lambda: action(q3_single_day_lookup(optimized)),
+        ),
+        "q4_join_filter_before_join": (
+            lambda: action(q4_join_filter_before_join(baseline, bookings)),
+            lambda: action(q4_join_filter_before_join(optimized, bookings)),
+        ),
+        "q5_wide_scan_agg": (
+            lambda: action(q5_wide_scan_agg(baseline)),
+            lambda: action(q5_wide_scan_agg(optimized)),
+        ),
+    }
+
+    per_query = []
+    total_baseline = 0.0
+    total_optimized = 0.0
+    for name, desc in QUERIES:
+        base_fn, opt_fn = plans[name]
+        print(f"Timing {name} on baseline ...")
+        base_med = _time_query(base_fn, runs)
+        print(f"Timing {name} on optimized ...")
+        opt_med = _time_query(opt_fn, runs)
+        reduction = (base_med - opt_med) / base_med * 100.0 if base_med > 0 else 0.0
+        total_baseline += base_med
+        total_optimized += opt_med
+        per_query.append(
+            {
+                "query": name,
+                "description": desc,
+                "baseline_median_s": round(base_med, 4),
+                "optimized_median_s": round(opt_med, 4),
+                "speedup_x": round(base_med / opt_med, 2) if opt_med > 0 else None,
+                "reduction_pct": round(reduction, 2),
+            }
+        )
+        print(f"  {name}: baseline {base_med:.3f}s  optimized {opt_med:.3f}s  reduction {reduction:.1f}%")
+
+    overall_reduction = (total_baseline - total_optimized) / total_baseline * 100.0 if total_baseline > 0 else 0.0
+    return {
+        "runs_per_query": runs,
+        "query_count": len(QUERIES),
+        "total_baseline_median_s": round(total_baseline, 4),
+        "total_optimized_median_s": round(total_optimized, 4),
+        "overall_reduction_pct": round(overall_reduction, 2),
+        "overall_speedup_x": round(total_baseline / total_optimized, 2) if total_optimized > 0 else None,
+        "per_query": per_query,
+    }
+
+
+def _folder_size_bytes(path: Path) -> int:
+    """Total size in bytes of all files under a directory."""
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def write_results(results: dict, rows: int) -> None:
+    """Write results.json and a markdown table into the benchmark directory."""
+    results["dataset_rows"] = rows
+    results["baseline_bytes"] = _folder_size_bytes(BASELINE_CSV) if BASELINE_CSV.exists() else None
+    results["optimized_bytes"] = _folder_size_bytes(OPTIMIZED_TXNS) if OPTIMIZED_TXNS.exists() else None
+
+    (BENCH_ROOT / "results.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+
+    lines = [
+        "# Query Optimization Benchmark Results",
+        "",
+        f"- Dataset: {rows:,} synthetic transaction rows spanning {NUM_DAYS} days",
+        f"- Queries: {results['query_count']} representative analytical queries",
+        f"- Timing: median of {results['runs_per_query']} timed wall-clock runs per query after one warm-up",
+        f"- Baseline layout: a single large unpartitioned CSV, all columns, no columnar stats",
+        f"- Optimized layout: month-partitioned, compacted, column-pruned, sorted Parquet with row-group stats",
+        "",
+        f"## Overall runtime reduction: {results['overall_reduction_pct']}%",
+        "",
+        f"Total baseline time {results['total_baseline_median_s']}s vs optimized "
+        f"{results['total_optimized_median_s']}s across all queries "
+        f"(overall speedup {results['overall_speedup_x']}x).",
+        "",
+        "| Query | Technique | Baseline (s) | Optimized (s) | Speedup | Reduction |",
+        "| --- | --- | ---: | ---: | ---: | ---: |",
+    ]
+    for row in results["per_query"]:
+        lines.append(
+            f"| {row['query']} | {row['description']} | {row['baseline_median_s']} | "
+            f"{row['optimized_median_s']} | {row['speedup_x']}x | {row['reduction_pct']}% |"
+        )
+    lines.append("")
+    (BENCH_ROOT / "RESULTS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"\nWrote {BENCH_ROOT / 'results.json'} and {BENCH_ROOT / 'RESULTS.md'}")
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Query-optimization benchmark: baseline vs optimized lake.")
+    parser.add_argument("--rows", type=int, default=30_000_000, help="Synthetic transaction rows.")
+    parser.add_argument("--runs", type=int, default=5, help="Timed runs per query (median is reported).")
+    parser.add_argument("--rebuild", action="store_true", help="Rebuild datasets even if present.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> None:
+    """Build datasets if needed, run the benchmark, and write results."""
+    args = _parse_args(argv)
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    spark = build_spark()
+    spark.sparkContext.setLogLevel("ERROR")
+    try:
+        need_build = args.rebuild or not OPTIMIZED_TXNS.exists() or not BASELINE_CSV.exists()
+        if need_build:
+            build_datasets(spark, args.rows)
+        else:
+            print("Reusing existing datasets under benchmark/_data (pass --rebuild to regenerate).")
+        results = run_benchmark(spark, args.runs)
+        write_results(results, args.rows)
+        print(f"\nOVERALL RUNTIME REDUCTION: {results['overall_reduction_pct']}%")
+    finally:
+        spark.stop()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

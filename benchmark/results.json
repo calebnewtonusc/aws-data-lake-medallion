@@ -1,0 +1,53 @@
+{
+  "runs_per_query": 3,
+  "query_count": 5,
+  "total_baseline_median_s": 23.3834,
+  "total_optimized_median_s": 1.2771,
+  "overall_reduction_pct": 94.54,
+  "overall_speedup_x": 18.31,
+  "per_query": [
+    {
+      "query": "q1_date_range_agg",
+      "description": "Date-range aggregation (partition pruning + stats)",
+      "baseline_median_s": 5.1266,
+      "optimized_median_s": 0.1023,
+      "speedup_x": 50.12,
+      "reduction_pct": 98.0
+    },
+    {
+      "query": "q2_status_filter_group",
+      "description": "Status filter + group by (column pruning + pushdown)",
+      "baseline_median_s": 4.0546,
+      "optimized_median_s": 0.2891,
+      "speedup_x": 14.03,
+      "reduction_pct": 92.87
+    },
+    {
+      "query": "q3_single_day_lookup",
+      "description": "Single-day point lookup (partition pruning)",
+      "baseline_median_s": 4.4786,
+      "optimized_median_s": 0.0634,
+      "speedup_x": 70.59,
+      "reduction_pct": 98.58
+    },
+    {
+      "query": "q4_join_filter_before_join",
+      "description": "Join with filter-before-join rewrite",
+      "baseline_median_s": 5.3286,
+      "optimized_median_s": 0.532,
+      "speedup_x": 10.02,
+      "reduction_pct": 90.02
+    },
+    {
+      "query": "q5_wide_scan_agg",
+      "description": "Wide-table scan aggregation (column pruning)",
+      "baseline_median_s": 4.395,
+      "optimized_median_s": 0.2902,
+      "speedup_x": 15.14,
+      "reduction_pct": 93.4
+    }
+  ],
+  "dataset_rows": 20000000,
+  "baseline_bytes": 4915389128,
+  "optimized_bytes": 264543694
+}

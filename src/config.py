@@ -26,9 +26,14 @@ BRONZE_PREFIX: str = "bronze"
 SILVER_PREFIX: str = "silver"
 GOLD_PREFIX: str = "gold"
 
-# The two source datasets that make up the Airbnb domain.
+# The four source datasets that make up the Airbnb domain. Listings and
+# reviews are the original pair; bookings and transactions add the revenue
+# side of the marketplace (a booking is a reserved stay, a transaction is a
+# payment event against that booking).
 LISTINGS_DATASET: str = "listings"
 REVIEWS_DATASET: str = "reviews"
+BOOKINGS_DATASET: str = "bookings"
+TRANSACTIONS_DATASET: str = "transactions"
 
 # Local filesystem root that mirrors the S3 lake layout. Spark reads and
 # writes here because the Hadoop s3a client against an in-process moto

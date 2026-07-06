@@ -10,3 +10,7 @@ derby.log
 scratch/*.parquet
 .ipynb_checkpoints/
 .pytest_cache/
+
+# Benchmark datasets are large and regenerated on demand; keep them offline.
+benchmark/_data/
+benchmark/_spark_warehouse/
