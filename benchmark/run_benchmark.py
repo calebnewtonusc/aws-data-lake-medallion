@@ -1,26 +1,39 @@
-"""Query-optimization benchmark: unoptimized lake vs optimized lake.
+"""Query-optimization benchmark: three physical layouts, one set of queries.
 
-This is the centerpiece of the project. It builds two physically different
+This is the centerpiece of the project. It builds three physically different
 copies of the same synthetic transaction data and times a fixed set of
-analytical queries against each, so the runtime reduction reported on the
-resume is a real measured number rather than an assumption.
+analytical queries against each, so the runtime reductions reported on the
+resume are real measured numbers rather than assumptions.
 
-Baseline layout (everything a slow lake gets wrong):
-  - a single large CSV, no columnar format, no column statistics
-  - unpartitioned, so every query scans the whole dataset
-  - unsorted, so predicate pushdown and min/max skipping cannot help
-  - all columns present, forcing full-width reads
+It reports two clearly separated reductions:
 
-Optimized layout (the techniques the resume bullet claims):
-  - Parquet with per-file column statistics (min/max, null counts)
-  - partitioned by transaction month, so date filters prune whole directories
-    without over-partitioning to thousands of tiny daily directories
-  - compacted into right-sized files (one file per partition) to kill the
-    small-file tax
-  - pruned to only the columns the queries need
-  - sorted within each partition on transaction date and the common filter
-    columns so Parquet row group min/max stats enable predicate pushdown and
-    page skipping even for day-level and status filters
+  1. Format + layout (CSV -> optimized Parquet). The whole improvement a raw
+     dump gets from being turned into a proper lake. Large, but part of it is
+     just the file-format change from row-oriented CSV to columnar Parquet.
+  2. Query optimization only (unoptimized Parquet -> optimized Parquet). Both
+     sides are Parquet, so the file format is held constant and the delta is
+     attributable purely to the query-optimization techniques: partitioning,
+     column pruning, file compaction, predicate pushdown, and SQL rewrites.
+     This is the honest number for the resume bullet's listed techniques.
+
+The three layouts:
+
+  Baseline A, raw CSV (everything a slow lake gets wrong):
+    - a single large CSV, no columnar format, no column statistics
+    - unpartitioned, unsorted, all columns present
+
+  Baseline B, unoptimized Parquet (fair "before" for query optimization):
+    - Parquet, but unpartitioned
+    - all columns present (no column pruning)
+    - unsorted, so min/max row-group skipping cannot help
+    - written as a few big files with no partition structure
+
+  Optimized, tuned Parquet (the techniques the resume bullet claims):
+    - partitioned by transaction month, so date filters prune whole directories
+    - compacted into one right-sized file per partition (small-file tax gone)
+    - pruned to only the columns the queries need
+    - sorted within each partition on transaction date and the common filter
+      columns so Parquet row-group min/max stats enable predicate pushdown
 
 The queries deliberately exercise each technique:
   q1 date-range aggregation      -> partition pruning + stats skipping
@@ -29,15 +42,15 @@ The queries deliberately exercise each technique:
   q4 join bookings to txns (rewrite: filter-before-join, no SELECT *)
   q5 wide full-scan aggregation   -> column pruning benefit on a heavy scan
 
-Each query runs on both datasets: one warm-up run (discarded) then several
+Each query runs on every layout: one warm-up run (discarded) then several
 timed runs, and the median wall-clock is taken to damp out JVM and OS noise.
-Spark is configured identically for both sides so the comparison is fair; the
+Spark is configured identically for all three so the comparison is fair; the
 only difference is the physical layout of the data.
 
 Run it:
 
     export JAVA_HOME=$(/usr/libexec/java_home)
-    python -m benchmark.run_benchmark --rows 30000000 --runs 5
+    python -m benchmark.run_benchmark --rows 20000000 --runs 3
 
 Datasets are written under benchmark/_data (gitignored) and reused across
 runs unless --rebuild is passed.
@@ -66,6 +79,7 @@ from pyspark.sql import functions as F  # noqa: E402
 BENCH_ROOT = Path(__file__).resolve().parent
 DATA_ROOT = BENCH_ROOT / "_data"
 BASELINE_CSV = DATA_ROOT / "baseline_csv"
+BASELINE_PARQUET = DATA_ROOT / "baseline_parquet"
 OPTIMIZED_TXNS = DATA_ROOT / "optimized_transactions"
 OPTIMIZED_BOOKINGS = DATA_ROOT / "optimized_bookings"
 
@@ -136,13 +150,26 @@ def build_datasets(spark: SparkSession, rows: int) -> None:
     print(f"Synthesizing {rows:,} transaction rows ...")
     txns = _synthesize(spark, rows)
 
-    # Baseline: one big CSV, unpartitioned, unsorted, all columns, no columnar
+    # Baseline A: one big CSV, unpartitioned, unsorted, all columns, no columnar
     # stats. coalesce(1) forces a single large file: the classic slow lake
     # shape a raw dump lands in before any optimization.
-    print("Writing baseline CSV (single unpartitioned file, all columns) ...")
+    print("Writing baseline A (single unpartitioned CSV, all columns) ...")
     if BASELINE_CSV.exists():
         shutil.rmtree(BASELINE_CSV)
     txns.coalesce(1).write.mode("overwrite").option("header", "true").csv(str(BASELINE_CSV))
+
+    # Baseline B: unoptimized Parquet. Same columnar file format as the
+    # optimized side, but with none of the query-optimization work: not
+    # partitioned, not sorted, all columns present, written as a few big files.
+    # Holding the file format constant against the optimized layout isolates the
+    # gain attributable purely to partitioning, column pruning, compaction,
+    # pushdown, and SQL rewrites. Row-group stats exist because Parquet always
+    # writes them, but without sorting they carry wide min/max ranges that
+    # cannot skip much, and without partitioning there is no directory pruning.
+    print("Writing baseline B (unpartitioned unsorted Parquet, all columns) ...")
+    if BASELINE_PARQUET.exists():
+        shutil.rmtree(BASELINE_PARQUET)
+    txns.coalesce(4).write.mode("overwrite").parquet(str(BASELINE_PARQUET))
 
     # Optimized transactions: partitioned by month (a sensible grain, not
     # over-partitioned to the day), one compacted file per partition, only the
@@ -275,78 +302,88 @@ def _time_query(fn, runs: int) -> float:
     return statistics.median(samples)
 
 
-def run_benchmark(spark: SparkSession, runs: int) -> dict:
-    """Time every query on the baseline and optimized layouts, return results.
+def _query_fn(name: str, df: DataFrame, bookings: DataFrame):
+    """Bind a query name and its input DataFrame to a no-arg timing callable.
 
-    The baseline is the raw unoptimized lake: a single large CSV with no
-    columnar format, no statistics, no partitioning, and every column present.
-    The optimized side is the month-partitioned, compacted, column-pruned,
-    sorted Parquet. Both are read with the same Spark session and config, so
-    the only difference is the physical data layout.
+    The callable triggers a full action (count) so the entire query executes.
     """
-    baseline = spark.read.option("header", "true").option("inferSchema", "true").csv(str(BASELINE_CSV))
+    builders = {
+        "q1_date_range_agg": lambda: q1_date_range_agg(df),
+        "q2_status_filter_group": lambda: q2_status_filter_group(df),
+        "q3_single_day_lookup": lambda: q3_single_day_lookup(df),
+        "q4_join_filter_before_join": lambda: q4_join_filter_before_join(df, bookings),
+        "q5_wide_scan_agg": lambda: q5_wide_scan_agg(df),
+    }
+    build = builders[name]
+    return lambda: build().count()
+
+
+def _reduction(before: float, after: float) -> float:
+    """Percentage runtime reduction going from `before` to `after`."""
+    return (before - after) / before * 100.0 if before > 0 else 0.0
+
+
+def run_benchmark(spark: SparkSession, runs: int) -> dict:
+    """Time every query on all three layouts and return two comparisons.
+
+    Layouts, all read with the same Spark session and config so the only
+    variable is the physical layout:
+      - baseline A: raw unoptimized CSV (row format, no partitioning/stats)
+      - baseline B: unoptimized Parquet (columnar, but no partitioning, no
+        sorting, all columns) -- the fair "before" for query optimization
+      - optimized: month-partitioned, compacted, column-pruned, sorted Parquet
+
+    Returns per-query medians for all three layouts plus two headline
+    reductions: format+layout (CSV -> optimized) and query-optimization-only
+    (unoptimized Parquet -> optimized).
+    """
+    csv_baseline = spark.read.option("header", "true").option("inferSchema", "true").csv(str(BASELINE_CSV))
+    parquet_baseline = spark.read.parquet(str(BASELINE_PARQUET))
     optimized = spark.read.parquet(str(OPTIMIZED_TXNS))
     bookings = spark.read.parquet(str(OPTIMIZED_BOOKINGS))
 
-    # Bind each query name to a no-arg callable that triggers a full action.
-    def action(df: DataFrame) -> int:
-        return df.count()
-
-    plans = {
-        "q1_date_range_agg": (
-            lambda: action(q1_date_range_agg(baseline)),
-            lambda: action(q1_date_range_agg(optimized)),
-        ),
-        "q2_status_filter_group": (
-            lambda: action(q2_status_filter_group(baseline)),
-            lambda: action(q2_status_filter_group(optimized)),
-        ),
-        "q3_single_day_lookup": (
-            lambda: action(q3_single_day_lookup(baseline)),
-            lambda: action(q3_single_day_lookup(optimized)),
-        ),
-        "q4_join_filter_before_join": (
-            lambda: action(q4_join_filter_before_join(baseline, bookings)),
-            lambda: action(q4_join_filter_before_join(optimized, bookings)),
-        ),
-        "q5_wide_scan_agg": (
-            lambda: action(q5_wide_scan_agg(baseline)),
-            lambda: action(q5_wide_scan_agg(optimized)),
-        ),
-    }
-
     per_query = []
-    total_baseline = 0.0
+    total_csv = 0.0
+    total_parquet = 0.0
     total_optimized = 0.0
     for name, desc in QUERIES:
-        base_fn, opt_fn = plans[name]
-        print(f"Timing {name} on baseline ...")
-        base_med = _time_query(base_fn, runs)
-        print(f"Timing {name} on optimized ...")
-        opt_med = _time_query(opt_fn, runs)
-        reduction = (base_med - opt_med) / base_med * 100.0 if base_med > 0 else 0.0
-        total_baseline += base_med
+        print(f"Timing {name} on raw CSV baseline ...")
+        csv_med = _time_query(_query_fn(name, csv_baseline, bookings), runs)
+        print(f"Timing {name} on unoptimized Parquet baseline ...")
+        parquet_med = _time_query(_query_fn(name, parquet_baseline, bookings), runs)
+        print(f"Timing {name} on optimized layout ...")
+        opt_med = _time_query(_query_fn(name, optimized, bookings), runs)
+
+        total_csv += csv_med
+        total_parquet += parquet_med
         total_optimized += opt_med
         per_query.append(
             {
                 "query": name,
                 "description": desc,
-                "baseline_median_s": round(base_med, 4),
+                "csv_baseline_median_s": round(csv_med, 4),
+                "parquet_baseline_median_s": round(parquet_med, 4),
                 "optimized_median_s": round(opt_med, 4),
-                "speedup_x": round(base_med / opt_med, 2) if opt_med > 0 else None,
-                "reduction_pct": round(reduction, 2),
+                "format_layout_reduction_pct": round(_reduction(csv_med, opt_med), 2),
+                "query_opt_reduction_pct": round(_reduction(parquet_med, opt_med), 2),
+                "query_opt_speedup_x": round(parquet_med / opt_med, 2) if opt_med > 0 else None,
             }
         )
-        print(f"  {name}: baseline {base_med:.3f}s  optimized {opt_med:.3f}s  reduction {reduction:.1f}%")
+        print(
+            f"  {name}: csv {csv_med:.3f}s  parquet {parquet_med:.3f}s  optimized {opt_med:.3f}s  "
+            f"(query-opt reduction {_reduction(parquet_med, opt_med):.1f}%)"
+        )
 
-    overall_reduction = (total_baseline - total_optimized) / total_baseline * 100.0 if total_baseline > 0 else 0.0
     return {
         "runs_per_query": runs,
         "query_count": len(QUERIES),
-        "total_baseline_median_s": round(total_baseline, 4),
+        "total_csv_baseline_median_s": round(total_csv, 4),
+        "total_parquet_baseline_median_s": round(total_parquet, 4),
         "total_optimized_median_s": round(total_optimized, 4),
-        "overall_reduction_pct": round(overall_reduction, 2),
-        "overall_speedup_x": round(total_baseline / total_optimized, 2) if total_optimized > 0 else None,
+        "format_layout_reduction_pct": round(_reduction(total_csv, total_optimized), 2),
+        "format_layout_speedup_x": round(total_csv / total_optimized, 2) if total_optimized > 0 else None,
+        "query_opt_reduction_pct": round(_reduction(total_parquet, total_optimized), 2),
+        "query_opt_speedup_x": round(total_parquet / total_optimized, 2) if total_optimized > 0 else None,
         "per_query": per_query,
     }
 
@@ -357,9 +394,10 @@ def _folder_size_bytes(path: Path) -> int:
 
 
 def write_results(results: dict, rows: int) -> None:
-    """Write results.json and a markdown table into the benchmark directory."""
+    """Write results.json and a two-comparison markdown report."""
     results["dataset_rows"] = rows
-    results["baseline_bytes"] = _folder_size_bytes(BASELINE_CSV) if BASELINE_CSV.exists() else None
+    results["csv_baseline_bytes"] = _folder_size_bytes(BASELINE_CSV) if BASELINE_CSV.exists() else None
+    results["parquet_baseline_bytes"] = _folder_size_bytes(BASELINE_PARQUET) if BASELINE_PARQUET.exists() else None
     results["optimized_bytes"] = _folder_size_bytes(OPTIMIZED_TXNS) if OPTIMIZED_TXNS.exists() else None
 
     (BENCH_ROOT / "results.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
@@ -370,22 +408,46 @@ def write_results(results: dict, rows: int) -> None:
         f"- Dataset: {rows:,} synthetic transaction rows spanning {NUM_DAYS} days",
         f"- Queries: {results['query_count']} representative analytical queries",
         f"- Timing: median of {results['runs_per_query']} timed wall-clock runs per query after one warm-up",
-        f"- Baseline layout: a single large unpartitioned CSV, all columns, no columnar stats",
-        f"- Optimized layout: month-partitioned, compacted, column-pruned, sorted Parquet with row-group stats",
+        "- Three layouts on the same data and queries, same Spark config:",
+        "  - Baseline A: raw unoptimized CSV (row format, unpartitioned, all columns, no stats)",
+        "  - Baseline B: unoptimized Parquet (columnar, but unpartitioned, unsorted, all columns)",
+        "  - Optimized: month-partitioned, compacted, column-pruned, sorted Parquet with row-group stats",
         "",
-        f"## Overall runtime reduction: {results['overall_reduction_pct']}%",
+        "## Two measured reductions",
         "",
-        f"Total baseline time {results['total_baseline_median_s']}s vs optimized "
-        f"{results['total_optimized_median_s']}s across all queries "
-        f"(overall speedup {results['overall_speedup_x']}x).",
+        f"- **Format + layout (CSV to optimized Parquet): {results['format_layout_reduction_pct']}%** "
+        f"({results['format_layout_speedup_x']}x). Includes the row-to-columnar file-format change.",
+        f"- **Query optimization only (unoptimized Parquet to optimized Parquet): "
+        f"{results['query_opt_reduction_pct']}%** ({results['query_opt_speedup_x']}x). File format held "
+        f"constant, so this is attributable purely to partitioning, column pruning, file compaction, "
+        f"predicate pushdown, and SQL rewrites.",
         "",
-        "| Query | Technique | Baseline (s) | Optimized (s) | Speedup | Reduction |",
+        f"Totals across all queries: CSV {results['total_csv_baseline_median_s']}s, unoptimized Parquet "
+        f"{results['total_parquet_baseline_median_s']}s, optimized {results['total_optimized_median_s']}s.",
+        "",
+        "## Query optimization only: unoptimized Parquet vs optimized Parquet",
+        "",
+        "This is the honest number for the resume bullet's listed techniques.",
+        "",
+        "| Query | Technique | Unopt. Parquet (s) | Optimized (s) | Speedup | Reduction |",
         "| --- | --- | ---: | ---: | ---: | ---: |",
     ]
     for row in results["per_query"]:
         lines.append(
-            f"| {row['query']} | {row['description']} | {row['baseline_median_s']} | "
-            f"{row['optimized_median_s']} | {row['speedup_x']}x | {row['reduction_pct']}% |"
+            f"| {row['query']} | {row['description']} | {row['parquet_baseline_median_s']} | "
+            f"{row['optimized_median_s']} | {row['query_opt_speedup_x']}x | {row['query_opt_reduction_pct']}% |"
+        )
+    lines += [
+        "",
+        "## Format + layout: raw CSV vs optimized Parquet",
+        "",
+        "| Query | Technique | Raw CSV (s) | Optimized (s) | Reduction |",
+        "| --- | --- | ---: | ---: | ---: |",
+    ]
+    for row in results["per_query"]:
+        lines.append(
+            f"| {row['query']} | {row['description']} | {row['csv_baseline_median_s']} | "
+            f"{row['optimized_median_s']} | {row['format_layout_reduction_pct']}% |"
         )
     lines.append("")
     (BENCH_ROOT / "RESULTS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -394,8 +456,8 @@ def write_results(results: dict, rows: int) -> None:
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Query-optimization benchmark: baseline vs optimized lake.")
-    parser.add_argument("--rows", type=int, default=30_000_000, help="Synthetic transaction rows.")
-    parser.add_argument("--runs", type=int, default=5, help="Timed runs per query (median is reported).")
+    parser.add_argument("--rows", type=int, default=20_000_000, help="Synthetic transaction rows.")
+    parser.add_argument("--runs", type=int, default=3, help="Timed runs per query (median is reported).")
     parser.add_argument("--rebuild", action="store_true", help="Rebuild datasets even if present.")
     return parser.parse_args(argv)
 
@@ -407,14 +469,20 @@ def main(argv: list[str]) -> None:
     spark = build_spark()
     spark.sparkContext.setLogLevel("ERROR")
     try:
-        need_build = args.rebuild or not OPTIMIZED_TXNS.exists() or not BASELINE_CSV.exists()
+        need_build = (
+            args.rebuild
+            or not OPTIMIZED_TXNS.exists()
+            or not BASELINE_CSV.exists()
+            or not BASELINE_PARQUET.exists()
+        )
         if need_build:
             build_datasets(spark, args.rows)
         else:
             print("Reusing existing datasets under benchmark/_data (pass --rebuild to regenerate).")
         results = run_benchmark(spark, args.runs)
         write_results(results, args.rows)
-        print(f"\nOVERALL RUNTIME REDUCTION: {results['overall_reduction_pct']}%")
+        print(f"\nFORMAT + LAYOUT REDUCTION (CSV -> optimized): {results['format_layout_reduction_pct']}%")
+        print(f"QUERY-OPTIMIZATION-ONLY REDUCTION (Parquet -> optimized): {results['query_opt_reduction_pct']}%")
     finally:
         spark.stop()
 

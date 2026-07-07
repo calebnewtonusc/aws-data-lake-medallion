@@ -18,49 +18,73 @@ predicate pushdown, and SQL query rewrites.
 
 ## Query optimization results
 
-The headline number below is measured, not assumed. It comes from running
-`benchmark/run_benchmark.py`, which times each query multiple times and takes
-the median wall-clock after a warm-up run. See "Run the benchmark" for how to
-reproduce it.
+The numbers below are measured, not assumed. They come from running
+`benchmark/run_benchmark.py`, which builds three physical layouts of the same
+data, times each query on each layout multiple times, and takes the median
+wall-clock after a warm-up run. See "Run the benchmark" for how to reproduce.
 
 - Dataset: 20,000,000 synthetic transaction rows spanning 730 days
 - Queries: 5 representative analytical queries
 - Timing: median of 3 timed runs per query after one warm-up
-- Baseline layout: a single large unpartitioned CSV, all columns, no columnar
-  statistics
-- Optimized layout: month-partitioned, compacted, column-pruned, sorted Parquet
-  with row-group statistics
+- Same Spark session and config across all three layouts, so the only variable
+  is the physical layout of the data
 
-**Overall runtime reduction: 94.54% across all five queries (18.31x overall
-speedup), 23.38s down to 1.28s of total median query time.** The optimized
-layout is also 18.6x smaller on disk (4.9 GB of CSV down to 265 MB of Parquet).
+The benchmark reports two clearly separated reductions so the resume number is
+defensible in an interview:
 
-| Query                      | Technique demonstrated                               | Baseline (s) | Optimized (s) | Speedup | Reduction |
-| -------------------------- | ---------------------------------------------------- | -----------: | ------------: | ------: | --------: |
-| q1_date_range_agg          | Date-range aggregation (partition pruning + stats)   |         5.13 |          0.10 |  50.12x |     98.0% |
-| q2_status_filter_group     | Status filter + group by (column pruning + pushdown) |         4.05 |          0.29 |  14.03x |    92.87% |
-| q3_single_day_lookup       | Single-day point lookup (partition pruning)          |         4.48 |          0.06 |  70.59x |    98.58% |
-| q4_join_filter_before_join | Join with filter-before-join rewrite                 |         5.33 |          0.53 |  10.02x |    90.02% |
-| q5_wide_scan_agg           | Wide-table scan aggregation (column pruning)         |         4.40 |          0.29 |  15.14x |     93.4% |
+- **Format plus layout (raw CSV to optimized Parquet): 92.14%** (12.72x
+  speedup, 79.11s down to 6.22s total). This is the total improvement over a
+  raw dump, but part of it is the row-to-columnar file-format change from CSV
+  to Parquet, which a careful interviewer will discount.
+- **Query optimization only (unoptimized Parquet to optimized Parquet):
+  36.14%** (1.57x speedup, 9.74s down to 6.22s total). Both sides are Parquet,
+  so the file format is held constant and this reduction is attributable purely
+  to the query-optimization techniques below. This is the honest number for the
+  resume bullet. The optimized layout is also 6.5x smaller than the unoptimized
+  Parquet on disk (1.73 GB down to 265 MB) from column pruning and compaction.
 
-The gains are driven by, in order of impact:
+### Query optimization only: unoptimized Parquet to optimized Parquet
+
+Baseline B is columnar Parquet with all columns, unpartitioned, and unsorted.
+The optimized side is month-partitioned, compacted, column-pruned, and sorted
+with row-group statistics. Same file format on both sides.
+
+| Query                      | Technique demonstrated                               | Unopt. Parquet (s) | Optimized (s) | Speedup | Reduction |
+| -------------------------- | ---------------------------------------------------- | -----------------: | ------------: | ------: | --------: |
+| q1_date_range_agg          | Date-range aggregation (partition pruning + stats)   |               1.18 |          0.67 |   1.76x |    43.08% |
+| q2_status_filter_group     | Status filter + group by (column pruning + pushdown) |               1.74 |          1.52 |   1.15x |    12.67% |
+| q3_single_day_lookup       | Single-day point lookup (partition pruning)          |               0.71 |          0.30 |   2.37x |     57.8% |
+| q4_join_filter_before_join | Join with filter-before-join rewrite                 |               4.70 |          2.66 |   1.77x |    43.38% |
+| q5_wide_scan_agg           | Wide-table scan aggregation (column pruning)         |               1.41 |          1.07 |   1.32x |    24.27% |
+
+The query-optimization gain is driven by, in order of impact:
 
 - Partitioning: date-bounded queries prune whole month directories instead of
   scanning the full dataset.
 - Column pruning: reading only the columns a query needs, rather than every
   column of a wide row, so queries touch a fraction of the bytes.
-- Parquet plus predicate pushdown: the optimized side is columnar Parquet with
-  per-file min/max statistics, and rows are sorted within each partition so the
-  reader skips row groups that cannot match a filter. The baseline CSV has no
-  statistics and must be fully parsed.
+- Predicate pushdown: rows are sorted within each partition, so the tight
+  row-group min/max statistics let the Parquet reader skip row groups that
+  cannot match a filter. The unsorted baseline Parquet has wide min/max ranges
+  that skip little.
 - File compaction: the optimized data is written as one right-sized file per
-  partition, avoiding the small-file tax the naive layout pays.
+  partition, avoiding the small-file tax.
 - SQL query rewrites: the join query filters and projects both sides down
   before the join instead of joining wide tables and filtering afterward, and
   never uses SELECT star.
 
-The full per-query numbers and the exact configuration are written to
-`benchmark/results.json` and `benchmark/RESULTS.md` on every run.
+### Format plus layout: raw CSV to optimized Parquet
+
+| Query                      | Raw CSV (s) | Optimized (s) | Reduction |
+| -------------------------- | ----------: | ------------: | --------: |
+| q1_date_range_agg          |       18.68 |          0.67 |    96.41% |
+| q2_status_filter_group     |       11.41 |          1.52 |     86.7% |
+| q3_single_day_lookup       |       14.22 |          0.30 |     97.9% |
+| q4_join_filter_before_join |       15.37 |          2.66 |    82.67% |
+| q5_wide_scan_agg           |       19.42 |          1.07 |    94.51% |
+
+The full per-query numbers, both comparisons, and the exact configuration are
+written to `benchmark/results.json` and `benchmark/RESULTS.md` on every run.
 
 ## The AWS stack: S3, EMR, Athena, Spark, and Parquet
 
@@ -195,11 +219,14 @@ export JAVA_HOME=$(/usr/libexec/java_home)
 python -m benchmark.run_benchmark --rows 20000000 --runs 3
 ```
 
-It builds a baseline unoptimized CSV and an optimized Parquet layout of the same
-data, times each query on both, and writes `benchmark/results.json` and
-`benchmark/RESULTS.md`. Both sides use the same Spark session and configuration,
-so the only variable is the physical data layout. Increase `--rows` and `--runs`
-for a larger, steadier measurement.
+It builds three layouts of the same data: a raw unoptimized CSV, an unoptimized
+Parquet (columnar but unpartitioned, unsorted, all columns), and the optimized
+Parquet (partitioned, compacted, column-pruned, sorted). It times each query on
+all three and writes `benchmark/results.json` and `benchmark/RESULTS.md` with
+two reductions: format plus layout (CSV to optimized) and query optimization
+only (unoptimized Parquet to optimized). All three use the same Spark session
+and configuration, so the only variable is the physical data layout. Increase
+`--rows` and `--runs` for a larger, steadier measurement.
 
 ## Deploy to real AWS
 
