@@ -1,67 +1,214 @@
 {
   "runs_per_query": 3,
-  "query_count": 5,
-  "total_csv_baseline_median_s": 79.1065,
-  "total_parquet_baseline_median_s": 9.7366,
-  "total_optimized_median_s": 6.2177,
-  "format_layout_reduction_pct": 92.14,
-  "format_layout_speedup_x": 12.72,
-  "query_opt_reduction_pct": 36.14,
-  "query_opt_speedup_x": 1.57,
+  "query_count": 22,
+  "total_baseline_median_s": 43.9939,
+  "total_optimized_median_s": 11.4626,
+  "query_opt_reduction_pct": 73.94,
+  "query_opt_speedup_x": 3.84,
   "per_query": [
     {
-      "query": "q1_date_range_agg",
-      "description": "Date-range aggregation (partition pruning + stats)",
-      "csv_baseline_median_s": 18.6846,
-      "parquet_baseline_median_s": 1.1785,
-      "optimized_median_s": 0.6708,
-      "format_layout_reduction_pct": 96.41,
-      "query_opt_reduction_pct": 43.08,
-      "query_opt_speedup_x": 1.76
+      "query": "q01_date_range_revenue",
+      "description": "Date-range revenue by status",
+      "technique": "partition pruning + stats",
+      "baseline_median_s": 0.9159,
+      "optimized_median_s": 0.3151,
+      "reduction_pct": 65.6,
+      "speedup_x": 2.91
     },
     {
-      "query": "q2_status_filter_group",
-      "description": "Status filter + group by (column pruning + pushdown)",
-      "csv_baseline_median_s": 11.4082,
-      "parquet_baseline_median_s": 1.7377,
-      "optimized_median_s": 1.5176,
-      "format_layout_reduction_pct": 86.7,
-      "query_opt_reduction_pct": 12.67,
-      "query_opt_speedup_x": 1.15
+      "query": "q02_method_success",
+      "description": "Succeeded payments by method",
+      "technique": "column pruning + pushdown",
+      "baseline_median_s": 2.6623,
+      "optimized_median_s": 1.8858,
+      "reduction_pct": 29.17,
+      "speedup_x": 1.41
     },
     {
-      "query": "q3_single_day_lookup",
-      "description": "Single-day point lookup (partition pruning)",
-      "csv_baseline_median_s": 14.2221,
-      "parquet_baseline_median_s": 0.7067,
-      "optimized_median_s": 0.2982,
-      "format_layout_reduction_pct": 97.9,
-      "query_opt_reduction_pct": 57.8,
-      "query_opt_speedup_x": 2.37
+      "query": "q03_single_day",
+      "description": "Single-day currency totals",
+      "technique": "partition pruning",
+      "baseline_median_s": 0.7235,
+      "optimized_median_s": 0.2201,
+      "reduction_pct": 69.57,
+      "speedup_x": 3.29
     },
     {
-      "query": "q4_join_filter_before_join",
-      "description": "Join with filter-before-join rewrite",
-      "csv_baseline_median_s": 15.3673,
-      "parquet_baseline_median_s": 4.7046,
-      "optimized_median_s": 2.6639,
-      "format_layout_reduction_pct": 82.67,
-      "query_opt_reduction_pct": 43.38,
-      "query_opt_speedup_x": 1.77
+      "query": "q04_txn_listing_join",
+      "description": "Txns joined to listings by neighbourhood",
+      "technique": "join + partition prune",
+      "baseline_median_s": 1.2685,
+      "optimized_median_s": 0.4031,
+      "reduction_pct": 68.22,
+      "speedup_x": 3.15
     },
     {
-      "query": "q5_wide_scan_agg",
-      "description": "Wide-table scan aggregation (column pruning)",
-      "csv_baseline_median_s": 19.4243,
-      "parquet_baseline_median_s": 1.4091,
-      "optimized_median_s": 1.0671,
-      "format_layout_reduction_pct": 94.51,
-      "query_opt_reduction_pct": 24.27,
-      "query_opt_speedup_x": 1.32
+      "query": "q05_txn_booking_join",
+      "description": "Txns joined to bookings (filter-before-join)",
+      "technique": "join rewrite + prune",
+      "baseline_median_s": 2.7693,
+      "optimized_median_s": 1.0516,
+      "reduction_pct": 62.03,
+      "speedup_x": 2.63
+    },
+    {
+      "query": "q06_three_way_join",
+      "description": "Txns -> bookings -> listings 3-way join",
+      "technique": "multi-domain join + prune",
+      "baseline_median_s": 3.858,
+      "optimized_median_s": 2.3061,
+      "reduction_pct": 40.22,
+      "speedup_x": 1.67
+    },
+    {
+      "query": "q07_review_listing_join",
+      "description": "Reviews joined to listings, avg rating",
+      "technique": "join + partition prune",
+      "baseline_median_s": 0.5612,
+      "optimized_median_s": 0.3018,
+      "reduction_pct": 46.23,
+      "speedup_x": 1.86
+    },
+    {
+      "query": "q08_bookings_by_month",
+      "description": "Bookings by month and status",
+      "technique": "partition pruning (bookings)",
+      "baseline_median_s": 0.228,
+      "optimized_median_s": 0.1238,
+      "reduction_pct": 45.7,
+      "speedup_x": 1.84
+    },
+    {
+      "query": "q09_running_total",
+      "description": "Monthly revenue running total",
+      "technique": "window: running total + gold",
+      "baseline_median_s": 2.6525,
+      "optimized_median_s": 0.0978,
+      "reduction_pct": 96.31,
+      "speedup_x": 27.12
+    },
+    {
+      "query": "q10_topn_per_month",
+      "description": "Top-3 listings by revenue per month",
+      "technique": "window: dense_rank top-N + gold",
+      "baseline_median_s": 8.8428,
+      "optimized_median_s": 0.8121,
+      "reduction_pct": 90.82,
+      "speedup_x": 10.89
+    },
+    {
+      "query": "q11_moving_avg_3m",
+      "description": "3-month moving average of revenue",
+      "technique": "window: moving avg + gold",
+      "baseline_median_s": 2.3643,
+      "optimized_median_s": 0.119,
+      "reduction_pct": 94.97,
+      "speedup_x": 19.87
+    },
+    {
+      "query": "q12_nbhd_share",
+      "description": "Listing share of neighbourhood revenue",
+      "technique": "window: ratio + gold",
+      "baseline_median_s": 3.2506,
+      "optimized_median_s": 0.4052,
+      "reduction_pct": 87.53,
+      "speedup_x": 8.02
+    },
+    {
+      "query": "q13_rank_nbhd",
+      "description": "Rank neighbourhoods by quarter revenue",
+      "technique": "window: rank + join + prune",
+      "baseline_median_s": 2.3188,
+      "optimized_median_s": 0.45,
+      "reduction_pct": 80.59,
+      "speedup_x": 5.15
+    },
+    {
+      "query": "q14_mom_delta",
+      "description": "Month-over-month revenue delta (lag)",
+      "technique": "window: lag + gold",
+      "baseline_median_s": 1.1661,
+      "optimized_median_s": 0.0838,
+      "reduction_pct": 92.82,
+      "speedup_x": 13.92
+    },
+    {
+      "query": "q15_pareto_share",
+      "description": "Cumulative revenue share by listing",
+      "technique": "window: cumulative + gold",
+      "baseline_median_s": 0.9685,
+      "optimized_median_s": 0.1996,
+      "reduction_pct": 79.39,
+      "speedup_x": 4.85
+    },
+    {
+      "query": "q16_success_rate",
+      "description": "Payment success rate by method (quarter)",
+      "technique": "conditional agg + prune",
+      "baseline_median_s": 0.5602,
+      "optimized_median_s": 0.2087,
+      "reduction_pct": 62.76,
+      "speedup_x": 2.68
+    },
+    {
+      "query": "q17_conversion",
+      "description": "Booking-to-paid conversion per listing",
+      "technique": "join + partition prune",
+      "baseline_median_s": 0.2278,
+      "optimized_median_s": 0.1466,
+      "reduction_pct": 35.62,
+      "speedup_x": 1.55
+    },
+    {
+      "query": "q18_reviews_vs_revenue",
+      "description": "Reviews vs revenue per listing (quarter)",
+      "technique": "two-fact join + prune",
+      "baseline_median_s": 1.7388,
+      "optimized_median_s": 0.5327,
+      "reduction_pct": 69.36,
+      "speedup_x": 3.26
+    },
+    {
+      "query": "q19_wide_scan",
+      "description": "Wide-table full-scan aggregation",
+      "technique": "column pruning",
+      "baseline_median_s": 0.7187,
+      "optimized_median_s": 1.1755,
+      "reduction_pct": -63.56,
+      "speedup_x": 0.61
+    },
+    {
+      "query": "q20_avg_daily_rev",
+      "description": "Avg daily revenue by neighbourhood",
+      "technique": "join + prune + agg",
+      "baseline_median_s": 2.0343,
+      "optimized_median_s": 0.271,
+      "reduction_pct": 86.68,
+      "speedup_x": 7.51
+    },
+    {
+      "query": "q21_gold_preagg",
+      "description": "Revenue by neighbourhood from gold",
+      "technique": "optimized table design (pre-agg)",
+      "baseline_median_s": 2.7678,
+      "optimized_median_s": 0.1315,
+      "reduction_pct": 95.25,
+      "speedup_x": 21.05
+    },
+    {
+      "query": "q22_moving_avg_7d",
+      "description": "7-day moving avg of daily revenue",
+      "technique": "window: moving avg + prune",
+      "baseline_median_s": 1.3961,
+      "optimized_median_s": 0.2218,
+      "reduction_pct": 84.11,
+      "speedup_x": 6.29
     }
   ],
-  "dataset_rows": 20000000,
-  "csv_baseline_bytes": 4915389128,
-  "parquet_baseline_bytes": 1726637890,
-  "optimized_bytes": 264543694
+  "txn_rows": 60000000,
+  "booking_rows": 12000000,
+  "review_rows": 12000000,
+  "listing_rows": 50000,
+  "baseline_bytes": 6740756424,
+  "optimized_bytes": 1422905897
 }

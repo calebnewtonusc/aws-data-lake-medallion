@@ -222,6 +222,85 @@ the top right corner is N. Virginia (us-east-1), or whatever region you chose.
 
 ---
 
+## Step 5b: Scale the lake to 250+ GB on AWS (optional)
+
+The steps above build the medallion lake at the small validated sample size,
+because a laptop does not have hundreds of GB of free disk. The architecture,
+however, is designed to scale, and the scale-up is a single parameterized EMR
+job: `jobs/scale_generate_emr.py`. It generates the four source domains
+(listings, reviews, bookings, transactions) at any target size and writes them
+as partitioned, compacted, sorted Parquet directly into S3, which has no local
+disk limit. This is how the "250+ GB AWS data lake" is produced for real.
+
+It writes the same optimized physical layout the benchmark measured: each fact
+partitioned by month, compacted to right-sized files, sorted within partition so
+Parquet row-group statistics enable predicate pushdown. So the 250 GB lake on
+AWS carries the same query-optimization properties proven locally, at production
+scale.
+
+### Upload the scale job
+
+```sh
+cd /Users/joelnewton/Desktop/DE-Portfolio/aws-data-lake-medallion
+source deploy/config.sh
+aws s3 cp jobs/scale_generate_emr.py "s3://${BUCKET}/apps/scale_generate_emr.py"
+```
+
+### Submit it to EMR Serverless
+
+Reuse the EMR Serverless application and execution role that step 03 created.
+Get their ids and submit the job, pointing `--target-gb` at the size you want
+(250 for the resume-scale lake) and `--out` at a `scale/` prefix in your bucket:
+
+```sh
+APP_ID=$(aws emr-serverless list-applications \
+  --query "applications[?name=='airbnb-medallion'].id | [0]" --output text)
+ROLE_ARN=$(aws iam get-role --role-name airbnb-medallion-emr-exec-role \
+  --query 'Role.Arn' --output text)
+
+aws emr-serverless start-job-run \
+  --application-id "$APP_ID" \
+  --execution-role-arn "$ROLE_ARN" \
+  --name "scale-250gb" \
+  --job-driver "{
+    \"sparkSubmit\": {
+      \"entryPoint\": \"s3://${BUCKET}/apps/scale_generate_emr.py\",
+      \"entryPointArguments\": [
+        \"--out\", \"s3://${BUCKET}/scale\",
+        \"--target-gb\", \"250\",
+        \"--domain\", \"all\"
+      ],
+      \"sparkSubmitParameters\": \"--conf spark.executor.cores=4 --conf spark.executor.memory=12g --conf spark.executor.instances=20 --conf spark.driver.memory=8g\"
+    }
+  }"
+```
+
+The job prints the row counts it derives from `--target-gb` before writing (250
+GB is on the order of five billion transaction rows), then writes each domain.
+Because transactions carry about 80% of the volume, you can also generate one
+domain at a time with `--domain transactions|bookings|reviews|listings` and a
+smaller `--target-gb` to spread the run out.
+
+### Point Athena at the 250 GB tables
+
+Register external tables over `s3://<bucket>/scale/<domain>/` and load partitions
+the same way `04_athena.sh` does for the sample tables, using the DDL patterns in
+`sql/athena_ddl.sql`. Once the partitions are loaded, the same date-bounded and
+window-function queries in the benchmark run against the full 250 GB lake, and
+Athena only scans the month partitions each query touches.
+
+### Cost and cleanup for the scale run
+
+250 GB of Parquet in S3 is about 6 dollars a month of storage, and the one EMR
+Serverless generation run is billed only while it runs (a larger multi-worker
+job, so budget a few dollars, not cents). This is real money, so tear it down
+when you are done: `aws s3 rm "s3://${BUCKET}/scale" --recursive` removes the
+250 GB, and `deploy/99_teardown.sh` removes everything else. Only run the 250 GB
+generation when you specifically want the full-scale lake live; the sample lake
+from steps 01 to 04 is enough to see the architecture end to end.
+
+---
+
 ## Step 6: A realistic cost note
 
 For this tiny dataset the total cost of running the whole thing once is
